@@ -19,6 +19,17 @@ try {
   });
   console.log('✅ .env loaded');
 } catch(e) { console.log('⚠️  No .env file'); }
+const path = require('path');
+
+// Serve React build files
+app.use(express.static(path.join(__dirname, 'build')));
+
+// All non-API routes → serve React app
+app.get('*', (req, res) => {
+  if (!req.path.startsWith('/api') && !req.path.startsWith('/health')) {
+    res.sendFile(path.join(__dirname, 'build', 'index.html'));
+  }
+});
 
 const API_KEY = process.env.REACT_APP_GEMINI_API_KEY || '';
 const PORT = process.env.PORT || 3001;
