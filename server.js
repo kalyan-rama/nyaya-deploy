@@ -19,23 +19,10 @@ try {
   });
   console.log('✅ .env loaded');
 } catch(e) { console.log('⚠️  No .env file'); }
-const path = require('path');
-
-// Serve React build files
-app.use(express.static(path.join(__dirname, 'build')));
-
-// All non-API routes → serve React app
-app.get('*', (req, res) => {
-  if (!req.path.startsWith('/api') && !req.path.startsWith('/health')) {
-    res.sendFile(path.join(__dirname, 'build', 'index.html'));
-  }
-});
 
 const API_KEY = process.env.REACT_APP_GEMINI_API_KEY || '';
 const PORT = process.env.PORT || 3001;
 
-// Models ordered by reliability + free quota
-// gemini-2.0-flash-exp has highest free RPM (10 req/min vs 2 for flash)
 const MODELS = [
   'gemini-2.0-flash-exp',
   'gemini-2.0-flash',
@@ -43,11 +30,9 @@ const MODELS = [
   'gemini-1.5-flash-8b',
 ];
 
-// Cooldown per model (ms timestamp until available)
 const cooldownUntil = {};
 function available(m) { return !cooldownUntil[m] || Date.now() > cooldownUntil[m]; }
 function cooldown(m, ms) { cooldownUntil[m] = Date.now() + ms; }
-function nextModel() { return MODELS.find(available) || MODELS[0]; }
 
 function geminiRequest(model, body, apiKey) {
   return new Promise((resolve, reject) => {
@@ -57,7 +42,7 @@ function geminiRequest(model, body, apiKey) {
       path: `/v1beta/models/${model}:generateContent?key=${apiKey}`,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(postData) },
-      timeout: 12000  // 12s timeout — fail fast
+      timeout: 12000
     }, (res) => {
       let data = '';
       res.on('data', c => data += c);
@@ -70,7 +55,6 @@ function geminiRequest(model, body, apiKey) {
   });
 }
 
-// Try all models, return first success — no waiting, just fast switching
 async function tryAllModels(geminiBody, apiKey) {
   const tried = new Set();
   for (let pass = 0; pass < MODELS.length; pass++) {
@@ -79,17 +63,8 @@ async function tryAllModels(geminiBody, apiKey) {
     tried.add(model);
     try {
       const r = await geminiRequest(model, geminiBody, apiKey);
-      if (r.status === 429) {
-        // Rate limited — short 30s cooldown (not 60s) then try next immediately
-        cooldown(model, 30000);
-        console.log(`⚡ ${model} rate-limited, switching instantly...`);
-        continue;
-      }
-      if (r.status === 404 || r.status === 400) {
-        cooldown(model, 3600000);
-        console.log(`❌ ${model} unavailable`);
-        continue;
-      }
+      if (r.status === 429) { cooldown(model, 30000); console.log(`⚡ ${model} rate-limited`); continue; }
+      if (r.status === 404 || r.status === 400) { cooldown(model, 3600000); console.log(`❌ ${model} unavailable`); continue; }
       let parsed;
       try { parsed = JSON.parse(r.body); } catch { continue; }
       if (parsed.error) {
@@ -101,14 +76,12 @@ async function tryAllModels(geminiBody, apiKey) {
       if (text) { console.log(`✅ ${model} replied`); return { ok: true, text, model }; }
     } catch(e) {
       if (e.message === 'TIMEOUT') { console.log(`⏱ ${model} timed out`); continue; }
-      console.log(`❌ ${model}: ${e.message}`);
-      continue;
+      console.log(`❌ ${model}: ${e.message}`); continue;
     }
   }
   return { ok: false };
 }
 
-// Smart legal knowledge base for INSTANT fallback (shown immediately if all models busy)
 const LEGAL_KB = {
   salary: {
     title: 'Payment of Wages Act 1936',
@@ -162,12 +135,44 @@ function instantLegalResponse(question) {
   return `**⚖️ NYAYA Legal AI — Your Rights at a Glance**\n\nI can help you with:\n💼 **Salary issues** → Payment of Wages Act\n👮 **Police & arrest** → Articles 20, 21, 22\n🏠 **Tenant rights** → Rent Control Act\n👩 **Women's safety** → Domestic Violence Act 2005\n🛒 **Consumer fraud** → Consumer Protection Act 2019\n📜 **RTI applications** → RTI Act 2005\n🏭 **Labour rights** → Labour Laws\n\n📞 **Free Legal Aid: 15100** (24/7, completely free)\n\n👉 **Please describe your problem in more detail** — e.g. "my employer didn't pay salary for 2 months" and I'll give you the exact law and steps.`;
 }
 
+// Helper: serve a static file from build/
+function serveStatic(res, filePath) {
+  const extMap = {
+    '.html': 'text/html',
+    '.js':   'application/javascript',
+    '.css':  'text/css',
+    '.json': 'application/json',
+    '.png':  'image/png',
+    '.ico':  'image/x-icon',
+    '.svg':  'image/svg+xml',
+    '.woff': 'font/woff',
+    '.woff2':'font/woff2',
+  };
+  fs.readFile(filePath, (err, data) => {
+    if (err) {
+      // Not found → serve index.html for React Router
+      const indexPath = path.join(__dirname, 'build', 'index.html');
+      fs.readFile(indexPath, (err2, indexData) => {
+        if (err2) { res.writeHead(404); res.end('Not found'); return; }
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(indexData);
+      });
+      return;
+    }
+    const ext = path.extname(filePath);
+    const contentType = extMap[ext] || 'application/octet-stream';
+    res.writeHead(200, { 'Content-Type': contentType });
+    res.end(data);
+  });
+}
+
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS, GET');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
+  // ── POST /api/chat ─────────────────────────────────────
   if (req.method === 'POST' && req.url === '/api/chat') {
     let body = '';
     req.on('data', c => body += c);
@@ -177,12 +182,10 @@ const server = http.createServer((req, res) => {
         res.writeHead(400, {'Content-Type':'application/json'});
         res.end(JSON.stringify({error:'Invalid JSON'})); return;
       }
-
       if (!API_KEY) {
         res.writeHead(500, {'Content-Type':'application/json'});
-        res.end(JSON.stringify({error:'GEMINI_KEY_MISSING: Add REACT_APP_GEMINI_API_KEY to .env'})); return;
+        res.end(JSON.stringify({error:'GEMINI_KEY_MISSING: Add REACT_APP_GEMINI_API_KEY to environment'})); return;
       }
-
       const geminiBody = {
         contents: payload.contents,
         generationConfig: { maxOutputTokens: 600, temperature: 0.7 }
@@ -190,24 +193,17 @@ const server = http.createServer((req, res) => {
       if (payload.systemInstruction) {
         geminiBody.system_instruction = { parts: [{ text: payload.systemInstruction }] };
       }
-
-      // Get the last user message for instant fallback
       const lastMsg = payload.contents?.slice(-1)?.[0]?.parts?.[0]?.text || '';
-
-      // Race: try Gemini with 10s timeout
-      // If it fails/times out → instant legal response, NO waiting
       const result = await Promise.race([
         tryAllModels(geminiBody, API_KEY),
         new Promise(r => setTimeout(() => r({ ok: false, timedOut: true }), 10000))
       ]);
-
       if (result.ok) {
         res.writeHead(200, {'Content-Type':'application/json'});
         res.end(JSON.stringify({
           candidates: [{ content: { parts: [{ text: result.text }] } }]
         }));
       } else {
-        // Instant intelligent fallback — responds in <1ms
         const fallbackText = instantLegalResponse(lastMsg);
         console.log(result.timedOut ? '⚡ Timeout — instant fallback' : '⚡ All models busy — instant fallback');
         res.writeHead(200, {'Content-Type':'application/json'});
@@ -220,6 +216,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── GET /health ────────────────────────────────────────
   if (req.url === '/health') {
     res.writeHead(200, {'Content-Type':'application/json'});
     res.end(JSON.stringify({
@@ -230,7 +227,12 @@ const server = http.createServer((req, res) => {
     }));
     return;
   }
-  res.writeHead(404); res.end('Not found');
+
+  // ── Serve React frontend ───────────────────────────────
+  let urlPath = req.url.split('?')[0];
+  if (urlPath === '/') urlPath = '/index.html';
+  const filePath = path.join(__dirname, 'build', urlPath);
+  serveStatic(res, filePath);
 });
 
 server.listen(PORT, () => {
@@ -238,5 +240,5 @@ server.listen(PORT, () => {
   console.log('   Models:  ' + MODELS.join(' → '));
   console.log('   URL:     http://localhost:' + PORT);
   console.log('   API Key: ' + (API_KEY ? '✅ (' + API_KEY.substring(0,8) + '...)' : '❌ NOT SET'));
-  console.log('\nNow run: npm start\n');
+  console.log('\nApp + API served at: http://localhost:' + PORT + '\n');
 });
